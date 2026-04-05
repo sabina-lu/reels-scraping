@@ -2,8 +2,9 @@ name: scrape-instagram
 
 on:
   schedule:
-    - cron: "17 2 * * *"
+    - cron: "17 2 * * *"   
       timezone: "Asia/Taipei"
+    - cron: "13 1 * * *"  
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── 現有 job：爬 reels dynamic data ──────────────────────────────────────
   scrape:
     runs-on: ubuntu-latest
     permissions:
@@ -43,14 +45,14 @@ jobs:
       - name: Ensure data files exist
         run: |
           mkdir -p data
-          [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
+          [ -f data/reels_static_info.csv ]  || printf "kol_account,reels_shortcode,post_time,duration,caption\n"          > data/reels_static_info.csv
           [ -f data/reels_dynamic_info.csv ] || printf "reels_shortcode,views,plays,likes,comments,timestamp\n" > data/reels_dynamic_info.csv
 
       - name: Run scraper
         env:
           TZ: Asia/Taipei
         run: |
-          python main.py
+          python get_new_reels.py
 
       - name: Commit and push CSV updates
         run: |
@@ -58,4 +60,58 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/*.csv
           git diff --cached --quiet || git commit -m "Update Instagram CSV data"
+          git push
+
+  # ── 新 job：掃 KOL 新貼文，寫入 reels_static_info.csv ──────────────────
+  scan-kol-new-posts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data files exist
+        run: |
+          mkdir -p data
+          [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
+          [ -f data/kol_list.csv ]          || printf "kol_account\n" > data/kol_list.csv
+
+      - name: Scan KOL new posts
+        env:
+          IG_COOKIE: ${{ secrets.IG_COOKIE }}
+          TZ: Asia/Taipei
+        run: |
+          python kol_new_posts_scraper.py \
+            --kol    data/kol_list.csv \
+            --static data/reels_static_info.csv \
+            --days   2
+
+      - name: Commit and push CSV updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/reels_static_info.csv
+          git diff --cached --quiet || git commit -m "Add new KOL reels to static info"
           git push
