@@ -254,13 +254,19 @@ def load_cookies_from_string(driver: webdriver.Chrome, cookie_str: str) -> None:
 
 # [FIX #4] Verify login succeeded before proceeding
 def verify_logged_in(driver: webdriver.Chrome) -> bool:
-    """Navigate to activity page; if redirected to /accounts/login/, cookies failed."""
     try:
         driver.get("https://www.instagram.com/accounts/activity/")
         time.sleep(3)
+
         if "login" in driver.current_url:
             print("❌ Cookie login verification failed — current URL indicates login wall")
             return False
+
+        body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        if "log in" in body_text or "login" in body_text:
+            print("❌ Login wall text detected")
+            return False
+
         print("✅ Login verified successfully")
         return True
     except Exception as exc:
@@ -417,16 +423,33 @@ def extract_timeline_from_js(driver: webdriver.Chrome) -> Optional[dict]:
 
 
 # [FIX #1] Wait for JS hydration before reading page source
-def wait_for_js_data(driver: webdriver.Chrome, timeout: int = 15) -> bool:
-    """Wait until Instagram's JS has injected timeline data into the page."""
+def wait_for_profile_ready(driver: webdriver.Chrome, timeout: int = 20) -> bool:
     try:
         WebDriverWait(driver, timeout).until(
-            lambda d: (
-                "edge_owner_to_timeline_media" in (d.page_source or "")
-                or d.find_elements(By.XPATH, "//meta[@property='og:description']")
-            )
+            lambda d: d.execute_script("return document.readyState") == "complete"
         )
-        return True
+
+        for _ in range(8):
+            # 1) JS memory 有資料
+            js_ok = extract_timeline_from_js(driver) is not None
+            if js_ok:
+                return True
+
+            # 2) DOM 已經有貼文/reel 連結
+            anchors = driver.find_elements(
+                By.XPATH,
+                '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
+            )
+            if anchors:
+                return True
+
+            # 3) 幫助 lazy load / hydration
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(1.2)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1.2)
+
+        return False
     except Exception:
         return False
 
@@ -445,7 +468,7 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
         driver.get(url)
 
         # [FIX #1] Wait for JS-hydrated data rather than just <body>
-        hydrated = wait_for_js_data(driver, timeout=15)
+        hydrated = wait_for_profile_ready(driver, timeout=20)
         if not hydrated:
             print(f"⚠️ {username}: page did not fully hydrate within timeout")
 
@@ -517,28 +540,76 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
 
 # ========= API fetch for changed accounts only =========
 def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
-    """
-    Extract timeline data from the currently loaded profile page.
-    Priority:
-      1. execute_script JS memory (most reliable on modern IG)
-      2. <script> tag JSON parsing
-      3. Regex fallback on raw HTML
-    NOTE: Call this immediately after get_profile_post_count() — driver must
-          still be on the profile page (no other driver.get() in between).
-    """
     if not driver:
         return None
 
     try:
+        ready = wait_for_profile_ready(driver, timeout=20)
+        if not ready:
+            print(f"⚠️ {username} profile page not fully ready")
+
         html = driver.page_source or ""
 
-        # [FIX #3] 1. Try JS memory first — most reliable on modern IG
+        # 1. JS memory first
         js_data = extract_timeline_from_js(driver)
         if js_data:
             print(f"✅ {username} extracted timeline from JS memory")
             return js_data
 
-        # 2. Parse <script> tags
+        # 2. DOM fallback: 從頁面上已經 render 的連結建 edges
+        anchors = driver.find_elements(
+            By.XPATH,
+            '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
+        )
+
+        seen = set()
+        edges = []
+
+        for a in anchors:
+            href = a.get_attribute("href") or a.get_attribute("href.baseVal") or ""
+            if not href:
+                continue
+
+            shortcode = None
+            is_video = "/reel/" in href
+
+            parts = [p for p in href.split("/") if p]
+            if "p" in parts:
+                idx = parts.index("p")
+                if idx + 1 < len(parts):
+                    shortcode = parts[idx + 1]
+            elif "reel" in parts:
+                idx = parts.index("reel")
+                if idx + 1 < len(parts):
+                    shortcode = parts[idx + 1]
+
+            if not shortcode or shortcode in seen:
+                continue
+            seen.add(shortcode)
+
+            edges.append({
+                "node": {
+                    "shortcode": shortcode,
+                    "is_video": is_video,
+                    "taken_at_timestamp": None,
+                    "video_duration": None,
+                    "edge_media_to_caption": {"edges": []},
+                }
+            })
+
+        if edges:
+            print(f"✅ {username} extracted {len(edges)} timeline nodes from DOM anchors")
+            return {
+                "data": {
+                    "user": {
+                        "edge_owner_to_timeline_media": {
+                            "edges": edges
+                        }
+                    }
+                }
+            }
+
+        # 3. 原本 script / regex fallback 保留
         script_texts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S | re.I)
         for raw in script_texts:
             if "edge_owner_to_timeline_media" not in raw:
@@ -557,65 +628,6 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
                         return result
                 except Exception:
                     continue
-
-        # 3. Regex fallback on raw HTML
-        edges = []
-        seen: set = set()
-        pattern = re.compile(
-            r'"shortcode":"(?P<shortcode>[^"]+)".{0,2000}?"is_video":(?P<is_video>true|false).{0,4000}?"taken_at_timestamp":(?P<ts>\d+)',
-            flags=re.S,
-        )
-        for m in pattern.finditer(html):
-            shortcode = m.group("shortcode")
-            if shortcode in seen:
-                continue
-            seen.add(shortcode)
-
-            is_video = m.group("is_video") == "true"
-            ts = int(m.group("ts"))
-
-            caption = ""
-            snippet_start = max(0, m.start() - 500)
-            snippet_end = min(len(html), m.end() + 3000)
-            snippet = html[snippet_start:snippet_end]
-
-            cap_match = re.search(
-                r'"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"(.*?)"\}\}\]\}',
-                snippet,
-                flags=re.S,
-            )
-            if cap_match:
-                caption = bytes(cap_match.group(1), "utf-8").decode("unicode_escape", errors="ignore")
-
-            duration = None
-            dur_match = re.search(r'"video_duration":([0-9.]+)', snippet)
-            if dur_match:
-                try:
-                    duration = float(dur_match.group(1))
-                except Exception:
-                    duration = None
-
-            edges.append({
-                "node": {
-                    "shortcode": shortcode,
-                    "is_video": is_video,
-                    "taken_at_timestamp": ts,
-                    "video_duration": duration,
-                    "edge_media_to_caption": {
-                        "edges": [{"node": {"text": caption}}] if caption else []
-                    },
-                }
-            })
-
-        if edges:
-            print(f"✅ {username} extracted {len(edges)} timeline nodes via HTML regex fallback")
-            return {
-                "data": {
-                    "user": {
-                        "edge_owner_to_timeline_media": {"edges": edges}
-                    }
-                }
-            }
 
         print(f"⚠️ {username} could not extract timeline data from current page")
         return None
@@ -660,24 +672,52 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
 
     cutoff = now_local() - dt.timedelta(days=REELS_WINDOW_DAYS)
 
-    for edge in edges:
+    skipped_no_shortcode = 0
+    skipped_not_video = 0
+    skipped_no_timestamp = 0
+    skipped_old = 0
+    skipped_existing = 0
+    accepted = 0
+
+    for i, edge in enumerate(edges, start=1):
         node = edge.get("node", {})
         shortcode = str(node.get("shortcode") or "").strip()
         is_video = node.get("is_video", False)
         timestamp = node.get("taken_at_timestamp")
 
-        if not shortcode or not is_video or not timestamp:
+        if not shortcode:
+            skipped_no_shortcode += 1
+            print(f"SKIP #{i}: no shortcode")
             continue
 
-        try:
-            post_dt = dt.datetime.fromtimestamp(timestamp)
-        except Exception:
-            continue
-
-        if post_dt < cutoff:
+        if not is_video:
+            skipped_not_video += 1
+            print(f"SKIP #{i}: shortcode={shortcode} is not video")
             continue
 
         if shortcode in existing_shortcodes:
+            skipped_existing += 1
+            print(f"SKIP #{i}: shortcode={shortcode} already exists in static_df")
+            continue
+
+        post_dt = None
+        if timestamp:
+            try:
+                post_dt = dt.datetime.fromtimestamp(timestamp)
+            except Exception as exc:
+                skipped_no_timestamp += 1
+                print(f"SKIP #{i}: shortcode={shortcode} timestamp parse failed: {exc}")
+                continue
+        else:
+            skipped_no_timestamp += 1
+            print(f"WARN #{i}: shortcode={shortcode} is video but no taken_at_timestamp, will try detail page later")
+
+        if post_dt is not None and post_dt < cutoff:
+            skipped_old += 1
+            print(
+                f"SKIP #{i}: shortcode={shortcode} too old "
+                f"post_dt={post_dt.strftime('%Y-%m-%d %H:%M:%S')} cutoff={cutoff.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             continue
 
         caption_edges = node.get("edge_media_to_caption", {}).get("edges", [])
@@ -686,26 +726,46 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
         results.append({
             "kol_account": username,
             "reels_shortcode": shortcode,
-            "post_time": post_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "post_time": post_dt.strftime("%Y-%m-%d %H:%M:%S") if post_dt else None,
             "duration": node.get("video_duration"),
             "caption": caption_text,
         })
+        accepted += 1
+        print(
+            f"KEEP #{i}: shortcode={shortcode} "
+            f"post_dt={post_dt.strftime('%Y-%m-%d %H:%M:%S') if post_dt else 'None'}"
+        )
+
+    print(
+        f"ℹ️ {username} reel filter summary | "
+        f"total_edges={len(edges)} | accepted={accepted} | "
+        f"no_shortcode={skipped_no_shortcode} | "
+        f"not_video={skipped_not_video} | "
+        f"no_timestamp={skipped_no_timestamp} | "
+        f"too_old={skipped_old} | "
+        f"already_exists={skipped_existing}"
+    )
 
     return results
 
 
+def get_post_timestamp(driver):
+    try:
+        time_el = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "time"))
+        )
+        dt_str = time_el.get_attribute("datetime")
+        return dt.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chrome] = None) -> Optional[dict]:
-    """
-    Navigate to reel page and extract engagement metrics.
-    Tries JS memory first, then page source regex.
-    """
     if not driver:
         return None
 
     try:
         driver.get(f"https://www.instagram.com/reel/{shortcode}/")
-
-        # [FIX #1] Wait for page data to hydrate
         wait_for_js_data(driver, timeout=10)
 
         html = driver.page_source or ""
@@ -718,7 +778,11 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chro
         }
         found_any = False
 
-        # 1. Try JS memory for the reel node
+        post_dt = get_post_timestamp(driver)
+        if post_dt is not None:
+            node["post_time"] = post_dt.strftime("%Y-%m-%d %H:%M:%S")
+            node["taken_at_timestamp"] = int(post_dt.timestamp())
+
         try:
             result = driver.execute_script(f"""
                 try {{
@@ -749,7 +813,6 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chro
         except Exception:
             pass
 
-        # 2. Regex fallback on page source
         if not found_any:
             view_match = re.search(r'"video_view_count":(\d+)', html)
             if view_match:
@@ -771,7 +834,7 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chro
                 node["edge_media_to_comment"]["count"] = int(comment_match.group(1))
                 found_any = True
 
-        if found_any:
+        if found_any or post_dt is not None:
             return node
 
         print(f"⚠️ No metrics found for reel {shortcode}")
@@ -780,7 +843,7 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chro
     except Exception as exc:
         print(f"❌ Error getting reel detail {shortcode}: {exc}")
         return None
-
+       
 
 def parse_likes(node: dict) -> int:
     return (
@@ -941,19 +1004,37 @@ def main() -> None:
 
             for static_row in recent_new_reels:
                 shortcode = static_row["reels_shortcode"]
+                print(f"➡️ Fetching detail for shortcode={shortcode}")
 
-                # get_reel_detail_by_shortcode will navigate away from profile page —
-                # that is intentional here; profile data is already captured above.
                 detail_node = get_reel_detail_by_shortcode(shortcode, driver)
 
                 if detail_node:
                     if static_row["duration"] is None:
                         static_row["duration"] = detail_node.get("video_duration")
-                    new_dynamic_rows.append(build_dynamic_snapshot(shortcode, detail_node))
+
+                    if not static_row.get("post_time"):
+                        static_row["post_time"] = detail_node.get("post_time")
+
+                    snapshot = build_dynamic_snapshot(shortcode, detail_node)
+                    new_dynamic_rows.append(snapshot)
+
+                    print(
+                        f"✅ Detail fetched: {shortcode} | "
+                        f"post_time={static_row.get('post_time')} | "
+                        f"views={snapshot['views']} plays={snapshot['plays']} "
+                        f"likes={snapshot['likes']} comments={snapshot['comments']}"
+                    )
                 else:
                     print(f"⚠️ Detail fetch failed for shortcode={shortcode}; static row will still be saved")
 
                 new_static_rows.append(static_row)
+                print(f"✅ Static row appended: {shortcode}")
+
+                if not static_row.get("post_time"):
+                    print(f"⚠️ {shortcode} still has no post_time after detail fetch")
+                else:
+                    print(f"✅ {shortcode} post_time resolved: {static_row['post_time']}")
+
                 existing_shortcodes.add(shortcode)
                 sleep_random(DETAIL_SLEEP_RANGE)
 
