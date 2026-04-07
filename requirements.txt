@@ -1,1 +1,4 @@
+pandas
+curl-cffi
+selenium
 requests>=2.31.0

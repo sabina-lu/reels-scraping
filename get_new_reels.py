@@ -233,6 +233,7 @@ def build_driver() -> webdriver.Chrome:
     options.add_experimental_option("useAutomationExtension", False)
     options.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
 
+
     chrome_bin = os.environ.get("CHROME_BIN")
     if not chrome_bin:
         # Check macOS first
