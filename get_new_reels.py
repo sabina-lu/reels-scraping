@@ -760,6 +760,37 @@ def get_post_timestamp(driver):
         return None
 
 
+def wait_for_profile_ready(driver: webdriver.Chrome, timeout: int = 20) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+        for _ in range(8):
+            # 1) JS memory 有資料
+            js_ok = extract_timeline_from_js(driver) is not None
+            if js_ok:
+                return True
+
+            # 2) DOM 已經有貼文/reel 連結
+            anchors = driver.find_elements(
+                By.XPATH,
+                '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
+            )
+            if anchors:
+                return True
+
+            # 3) 幫助 lazy load / hydration
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(1.2)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1.2)
+
+        return False
+    except Exception:
+        return False
+
+
 def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chrome] = None) -> Optional[dict]:
     if not driver:
         return None
