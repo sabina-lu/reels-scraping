@@ -96,7 +96,7 @@ jobs:
         run: |
           mkdir -p data
           [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
-          [ -f data/kol_list.csv ]          || printf "kol_account\n" > data/kol_list.csv
+          [ -f data/kol_list.csv ]          || printf "kol_account\n" > data/kol_info.csv
 
       - name: Scan KOL new posts
         env:
