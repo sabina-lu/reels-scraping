@@ -557,16 +557,13 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
             return js_data
 
         # 2. DOM fallback: 從頁面上已經 render 的連結建 edges
-        anchors = driver.find_elements(
-            By.XPATH,
-            '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
-        )
+        anchors = anchors[:3]
 
         seen = set()
         edges = []
 
-        for a in anchors[:3]:
-            href = a.get_attribute("href") or a.get_attribute("href.baseVal") or ""
+        for a in anchors:
+            href = a.get_attribute("href") or ""
             if not href:
                 continue
 
@@ -596,7 +593,7 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
                     "edge_media_to_caption": {"edges": []},
                 }
             })
-
+         
         if edges:
             print(f"✅ {username} extracted {len(edges)} timeline nodes from DOM anchors")
             return {
@@ -701,6 +698,16 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
             continue
 
         post_dt = None
+        if timestamp:
+            try:
+                post_dt = dt.datetime.fromtimestamp(timestamp)
+            except Exception as exc:
+                skipped_no_timestamp += 1
+                print(f"SKIP #{i}: shortcode={shortcode} timestamp parse failed: {exc}")
+                continue
+        else:
+            skipped_no_timestamp += 1
+            print(f"WARN #{i}: shortcode={shortcode} is video but no taken_at_timestamp, will try detail page later")
 
         if post_dt is not None and post_dt < cutoff:
             skipped_old += 1
