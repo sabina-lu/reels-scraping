@@ -221,6 +221,40 @@ def normalize_count_text(text: str) -> Optional[int]:
 
 
 # ========= Selenium profile gate =========
+
+
+def parse_cookie_string(cookie_str: str) -> list[dict]:
+    """把 cookie header 字串轉成 selenium 可用的格式"""
+    cookies = []
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": ".instagram.com",
+                "path": "/",
+            })
+    return cookies
+
+
+def load_cookies_from_string(driver: webdriver.Chrome, cookie_str: str) -> None:
+    """先訪問 instagram 建立 session，再注入 cookie"""
+    driver.get("https://www.instagram.com/")
+    time.sleep(2)
+
+    for cookie in parse_cookie_string(cookie_str):
+        try:
+            driver.add_cookie(cookie)
+        except Exception as e:
+            print(f"⚠️ Failed to add cookie {cookie['name']}: {e}")
+
+    driver.refresh()
+    time.sleep(3)
+    print("✅ Cookies injected")
+
+
 def build_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -360,10 +394,61 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
 
 # ========= API fetch for changed accounts only =========
 def get_profile_info(username: str, driver: Optional[webdriver.Chrome] = None):
-    """Get profile info - return minimal data since we only need count"""
-    # Since we already have post count from get_profile_post_count via meta tags,
-    # and Instagram's API returns 401, we'll just return empty data to skip reel collection
-    # This is acceptable since reel collection requires additional API calls anyway
+    """用 Selenium 抓 profile 頁面的 JSON 資料"""
+    if not driver:
+        return None
+
+    try:
+        url = f"https://www.instagram.com/{username}/"
+        driver.get(url)
+        time.sleep(2)
+
+        html = driver.page_source or ""
+
+        # Instagram 把資料塞在 <script type="application/json"> 裡
+        matches = re.findall(
+            r'<script type="application/json" data-sjs>(.*?)</script>',
+            html
+        )
+
+        for raw in matches:
+            try:
+                blob = json.loads(raw)
+                # 遞迴搜尋包含 edge_owner_to_timeline_media 的節點
+                result = find_timeline_data(blob)
+                if result:
+                    return result
+            except Exception:
+                continue
+
+        print(f"⚠️ {username} could not extract profile JSON")
+        return None
+
+    except Exception as exc:
+        print(f"❌ get_profile_info error: {exc}")
+        return None
+
+
+def find_timeline_data(obj, depth=0) -> Optional[dict]:
+    """遞迴搜尋包含 edge_owner_to_timeline_media 的結構"""
+    if depth > 10:
+        return None
+
+    if isinstance(obj, dict):
+        if "edge_owner_to_timeline_media" in obj:
+            # 包成 extract_reels_within_days 期望的格式
+            return {"data": {"user": obj}}
+        for v in obj.values():
+            result = find_timeline_data(v, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(obj, list):
+        for item in obj:
+            result = find_timeline_data(item, depth + 1)
+            if result:
+                return result
+
     return None
 
 
@@ -567,6 +652,13 @@ def main() -> None:
     skipped_accounts = 0
 
     driver = build_driver()
+
+    # 注入 cookie
+    cookie_str = os.environ.get("IG_COOKIE", "")
+    if cookie_str:
+        load_cookies_from_string(driver, cookie_str)
+    else:
+        print("⚠️ IG_COOKIE not set, may be blocked")
 
     try:
         for _, row in kol_df.iterrows():
