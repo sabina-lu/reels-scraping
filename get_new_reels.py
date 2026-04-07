@@ -797,7 +797,7 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chro
 
     try:
         driver.get(f"https://www.instagram.com/reel/{shortcode}/")
-        wait_for_js_data(driver, timeout=10)
+        wait_for_profile_ready(driver, timeout=10)
 
         html = driver.page_source or ""
 
