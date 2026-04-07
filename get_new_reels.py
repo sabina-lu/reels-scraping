@@ -355,38 +355,55 @@ def extract_post_count_from_xpath(driver: webdriver.Chrome) -> Optional[int]:
 
 
 def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[int]:
+    """Get post count using Selenium to establish proper session, then extract from page"""
     try:
         url = f"https://www.instagram.com/{username}/"
         driver.get(url)
-
+        
+        # Wait only for body tag with short timeout
         try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, "//header//ul/li"))
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
         except:
             pass
-
-        time.sleep(3)  # 等 React 渲染
-
-        # ===== DEBUG: 印出 header 裡的所有文字 =====
+        
+        # No sleep - extract immediately
+        
+        # Try page_source first (fastest)
+        html = driver.page_source or ""
+        patterns = [
+            r'edge_owner_to_timeline_media\":\{\"count\":(\d+)',
+            r'"edge_owner_to_timeline_media":\s*\{\s*"count":\s*(\d+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                try:
+                    count = int(match.group(1))
+                    print(f"ℹ️ {username} current profile post count (page_source): {count}")
+                    return count
+                except Exception:
+                    continue
+        
+        # Try meta tag
         try:
-            header = driver.find_element(By.TAG_NAME, "header")
-            print(f"DEBUG header HTML:\n{header.get_attribute('innerHTML')[:3000]}")
-        except Exception as e:
-            print(f"DEBUG no header found: {e}")
-
-        # ===== DEBUG: 抓所有 li 元素 =====
-        try:
-            lis = driver.find_elements(By.XPATH, "//ul/li")
-            print(f"DEBUG li count: {len(lis)}")
-            for i, li in enumerate(lis[:10]):
-                print(f"DEBUG li[{i}] text={repr(li.text)} html={li.get_attribute('innerHTML')[:200]}")
-        except Exception as e:
-            print(f"DEBUG li error: {e}")
-
+            metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
+            for meta in metas:
+                content = (meta.get_attribute("content") or "").strip()
+                if not content:
+                    continue
+                match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
+                if match:
+                    count = normalize_count_text(match.group(1))
+                    if count is not None:
+                        print(f"ℹ️ {username} current profile post count (meta): {count}")
+                        return count
+        except:
+            pass
+        
         print(f"⚠️ Could not read post count for {username}")
         return None
-
     except Exception as exc:
         print(f"❌ Error getting post count: {exc}")
         return None
