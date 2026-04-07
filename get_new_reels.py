@@ -354,6 +354,62 @@ def extract_post_count_from_xpath(driver: webdriver.Chrome) -> Optional[int]:
     return None
 
 
+def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[int]:
+    """Get post count using Selenium to establish proper session, then extract from page"""
+    try:
+        url = f"https://www.instagram.com/{username}/"
+        driver.get(url)
+        
+        # Wait only for body tag with short timeout
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+        except:
+            pass
+        
+        # No sleep - extract immediately
+        
+        # Try page_source first (fastest)
+        html = driver.page_source or ""
+        patterns = [
+            r'edge_owner_to_timeline_media\":\{\"count\":(\d+)',
+            r'"edge_owner_to_timeline_media":\s*\{\s*"count":\s*(\d+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                try:
+                    count = int(match.group(1))
+                    print(f"ℹ️ {username} current profile post count (page_source): {count}")
+                    return count
+                except Exception:
+                    continue
+        
+        # Try meta tag
+        try:
+            metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
+            for meta in metas:
+                content = (meta.get_attribute("content") or "").strip()
+                if not content:
+                    continue
+                match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
+                if match:
+                    count = normalize_count_text(match.group(1))
+                    if count is not None:
+                        print(f"ℹ️ {username} current profile post count (meta): {count}")
+                        return count
+        except:
+            pass
+        
+        print(f"⚠️ Could not read post count for {username}")
+        return None
+    except Exception as exc:
+        print(f"❌ Error getting post count: {exc}")
+        return None
+
+
+# ========= API fetch for changed accounts only =========
 def get_profile_info(driver: webdriver.Chrome, username: str):
     """直接從目前已載入的 profile 頁面抽 timeline 資料，不重新開頁"""
     if not driver:
@@ -450,118 +506,6 @@ def get_profile_info(driver: webdriver.Chrome, username: str):
             }
 
         print(f"⚠️ {username} could not extract profile JSON from current page")
-        return None
-
-    except Exception as exc:
-        print(f"❌ get_profile_info_from_current_page error: {exc}")
-        return None
-
-
-# ========= API fetch for changed accounts only =========
-def get_profile_info(username: str, driver: Optional[webdriver.Chrome] = None):
-    """用 Selenium 抓 profile 頁面的 timeline 資料，盡量回傳 extract_reels_within_days 可用格式"""
-    if not driver:
-        return None
-
-    try:
-        url = f"https://www.instagram.com/{username}/"
-        driver.get(url)
-        time.sleep(2)
-
-        html = driver.page_source or ""
-        print(f"DEBUG profile html preview: {html[:1200]}")
-
-        # 1) 先嘗試從所有 script 抽 JSON
-        script_texts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S | re.I)
-
-        for raw in script_texts:
-            if "edge_owner_to_timeline_media" not in raw:
-                continue
-
-            cleaned = raw.strip()
-
-            # 有些 script 會有 JS 包裝，先嘗試抽出大括號主體
-            candidates = [cleaned]
-            brace_match = re.search(r"(\{.*\})", cleaned, flags=re.S)
-            if brace_match:
-                candidates.append(brace_match.group(1))
-
-            for candidate in candidates:
-                try:
-                    blob = json.loads(candidate)
-                    result = find_timeline_data(blob)
-                    if result:
-                        print(f"✅ {username} extracted profile JSON from script")
-                        return result
-                except Exception:
-                    continue
-
-        # 2) fallback: 直接從 HTML 抓節點資訊
-        edges = []
-        seen = set()
-
-        pattern = re.compile(
-            r'"shortcode":"(?P<shortcode>[^"]+)".{0,2000}?"is_video":(?P<is_video>true|false).{0,4000}?"taken_at_timestamp":(?P<ts>\d+)',
-            flags=re.S
-        )
-
-        for m in pattern.finditer(html):
-            shortcode = m.group("shortcode")
-            if shortcode in seen:
-                continue
-            seen.add(shortcode)
-
-            is_video = m.group("is_video") == "true"
-            ts = int(m.group("ts"))
-
-            # 嘗試抓 caption
-            caption = ""
-            snippet_start = max(0, m.start() - 500)
-            snippet_end = min(len(html), m.end() + 3000)
-            snippet = html[snippet_start:snippet_end]
-
-            cap_match = re.search(
-                r'"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"(.*?)"\}\}\]\}',
-                snippet,
-                flags=re.S
-            )
-            if cap_match:
-                caption = bytes(cap_match.group(1), "utf-8").decode("unicode_escape", errors="ignore")
-
-            # 嘗試抓 duration
-            duration = None
-            dur_match = re.search(r'"video_duration":([0-9.]+)', snippet)
-            if dur_match:
-                try:
-                    duration = float(dur_match.group(1))
-                except Exception:
-                    duration = None
-
-            edges.append({
-                "node": {
-                    "shortcode": shortcode,
-                    "is_video": is_video,
-                    "taken_at_timestamp": ts,
-                    "video_duration": duration,
-                    "edge_media_to_caption": {
-                        "edges": [{"node": {"text": caption}}] if caption else []
-                    },
-                }
-            })
-
-        if edges:
-            print(f"✅ {username} extracted {len(edges)} timeline nodes from HTML fallback")
-            return {
-                "data": {
-                    "user": {
-                        "edge_owner_to_timeline_media": {
-                            "edges": edges
-                        }
-                    }
-                }
-            }
-
-        print(f"⚠️ {username} could not extract profile JSON")
         return None
 
     except Exception as exc:
