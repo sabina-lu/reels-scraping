@@ -1,20 +1,15 @@
-name: scrape-instagram-dynamic
-
-env:
-  TZ: Asia/Taipei
+name: scrape-instagram-update
 
 on:
-  schedule:
-    - cron: "17 2 * * *" 
+  workflow_run:
+    workflows: ["scrape-instagram-scan"]
+    types:
+      - completed
   workflow_dispatch:
 
-concurrency:
-  group: scrape-instagram-dynamic
-  cancel-in-progress: false
-
 jobs:
-  scrape-reels-dynamic:
-    name: Update reels dynamic data
+  scrape-reels-update:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -27,9 +22,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,20 +32,6 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-
-      - name: Check Chrome
-        run: |
-          echo "CHROME_BIN=$CHROME_BIN"
-          which google-chrome || true
-          google-chrome --version || true
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -69,8 +47,7 @@ jobs:
           [ -f data/reels_dynamic_info.csv ] || printf "reels_shortcode,views,plays,likes,comments,timestamp\n" > data/reels_dynamic_info.csv
 
       - name: Run update_reels
-        run: |
-          python update_reels.py
+        run: python update_reels.py
 
       - name: Commit and push CSV updates
         run: |
